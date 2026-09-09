@@ -7,6 +7,33 @@ export const DEFAULT_TIMER_CONFIG: TimerConfig = {
   timeBoostAmountMs: 10_000,
 };
 
+export const ADAPTIVE_INITIAL_TIMER_MS = 10_000;
+export const ADAPTIVE_FLOOR_TIMER_MS = 3_000;
+export const TIME_BOOST_INCREMENT_MS = 5_000;
+
+/**
+ * Resolves the canonical adaptive per-move duration base in milliseconds
+ * based on highestTileEver reached in run (§21, §33).
+ */
+export function getAdaptiveTimerStageBaseMs(highestTileEver: number): number {
+  if (highestTileEver >= 8192) return 3_000;
+  if (highestTileEver >= 4096) return 4_000;
+  if (highestTileEver >= 2048) return 5_000;
+  if (highestTileEver >= 1024) return 6_000;
+  if (highestTileEver >= 512) return 7_000;
+  if (highestTileEver >= 256) return 8_000;
+  if (highestTileEver >= 128) return 9_000;
+  return 10_000;
+}
+
+/**
+ * Calculates the maximum cap for a Time Boost at a specific adaptive stage.
+ * Cap = stageBaseMs + 5000ms.
+ */
+export function getAdaptiveTimerMaxCapMs(stageBaseMs: number): number {
+  return stageBaseMs + TIME_BOOST_INCREMENT_MS;
+}
+
 /**
  * Returns tier duration based on the active tier.
  */

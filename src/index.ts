@@ -25,6 +25,11 @@ export {
   applyTimeBoostToTimer,
   evaluateTimer,
   DEFAULT_TIMER_CONFIG,
+  getAdaptiveTimerStageBaseMs,
+  getAdaptiveTimerMaxCapMs,
+  ADAPTIVE_INITIAL_TIMER_MS,
+  ADAPTIVE_FLOOR_TIMER_MS,
+  TIME_BOOST_INCREMENT_MS,
 } from './timer.js';
 export { createUndoSnapshot, pushHistory, popHistory } from './undo.js';
 export { serializeGameState, deserializeGameState, CURRENT_SERIALIZATION_VERSION } from './serialization.js';
@@ -37,6 +42,7 @@ export {
   MAX_REPLAY_SERIALIZED_BYTES_LIMIT,
   computeBoardHash,
   validateReplayV1,
+  applyReplayEventV1,
   playReplayV1,
   createReplayPlayerV1,
 } from './replay.js';
@@ -72,6 +78,8 @@ export type {
   ReplayValidationErrorCode,
   ReplayDesyncType,
   ReplayPlaybackState,
+  FullUndoSnapshot,
+  ReplayApplyResult,
   ReplayPlaybackResult,
   ReplayPlayerInstance,
 } from './replay.js';

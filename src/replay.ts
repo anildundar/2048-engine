@@ -8,6 +8,10 @@ import {
 import { executeMove } from './move.js';
 import { createGame } from './engine.js';
 import { ENGINE_VERSION, sha256 } from './hash.js';
+import {
+  getAdaptiveTimerMaxCapMs,
+  getAdaptiveTimerStageBaseMs,
+} from './timer.js';
 import type { Direction, GameStatus, TimerState } from './types.js';
 
 export const REPLAY_SCHEMA_VERSION = 1;
@@ -15,7 +19,7 @@ export const RULESET_VERSION = 'classic-v1';
 export const DEFAULT_CHECKPOINT_CADENCE = 50;
 export const MAX_REPLAY_EVENTS_LIMIT = 50_000;
 export const MAX_REPLAY_CHECKPOINTS_LIMIT = 2_000;
-export const MAX_REPLAY_SERIALIZED_BYTES_LIMIT = 1_500_000; // ~1.5MB ceiling
+export const MAX_REPLAY_SERIALIZED_BYTES_LIMIT = 1_500_000; // 1.5MB ceiling
 
 export type ReplayEventType =
   | 'RUN_START'
@@ -44,7 +48,7 @@ export interface ReplayEventV1 {
   addedSeconds?: number; // For TIME_BOOST or RESCUE_TIMEOUT (canonical 5s)
   restoredMoveIndex?: number; // For UNDO
   restoredScore?: number; // For UNDO
-  restoredBoard?: number[]; // For UNDO (optional checkpoint snapshot)
+  restoredBoard?: number[]; // For UNDO (optional snapshot)
   pauseDurationMs?: number; // For RESUME
   reason?: string; // For RUN_TERMINAL or ASSISTED_TRANSITION
   finalScore?: number; // For RUN_TERMINAL
@@ -60,7 +64,7 @@ export interface ReplayCheckpointV1 {
   competitiveClass: 'PURE' | 'ASSISTED';
   boardHash: string; // 64-char SHA-256 hex
   rngState?: number;
-  eventIndex?: number; // Canonical event cursor position for deterministic seek
+  eventIndex?: number; // Canonical event cursor position
 }
 
 export interface ReplayFinalSummaryV1 {
@@ -134,6 +138,8 @@ const VALID_EVENT_TYPES = new Set<ReplayEventType>([
   'RESCUE_UNDO',
   'RUN_TERMINAL',
 ]);
+
+const SHA256_HEX_REGEX = /^[0-9a-fA-F]{64}$/;
 
 function isValidBoardArray(arr: unknown): arr is number[] {
   if (!Array.isArray(arr) || arr.length !== BOARD_CELL_COUNT) return false;
@@ -253,6 +259,9 @@ export function validateReplayV1(raw: unknown): ReplayValidationResult {
       if (!ev.direction || !['up', 'down', 'left', 'right'].includes(ev.direction)) {
         return { valid: false, code: 'MALFORMED_EVENT', error: `MOVE event at index ${i} has invalid direction: ${String(ev.direction)}` };
       }
+      if (ev.scoreDelta !== undefined && (typeof ev.scoreDelta !== 'number' || !Number.isFinite(ev.scoreDelta) || ev.scoreDelta < 0)) {
+        return { valid: false, code: 'MALFORMED_EVENT', error: `MOVE event at index ${i} has negative or invalid scoreDelta` };
+      }
       if (ev.spawn) {
         if (typeof ev.spawn.index !== 'number' || ev.spawn.index < 0 || ev.spawn.index >= BOARD_CELL_COUNT) {
           return { valid: false, code: 'MALFORMED_EVENT', error: `MOVE event at index ${i} has invalid spawn cell: ${String(ev.spawn?.index)}` };
@@ -262,21 +271,36 @@ export function validateReplayV1(raw: unknown): ReplayValidationResult {
         }
       }
     } else if (ev.type === 'TIME_BOOST' || ev.type === 'RESCUE_TIMEOUT') {
-      if (ev.addedSeconds !== undefined && (typeof ev.addedSeconds !== 'number' || ev.addedSeconds <= 0)) {
-        return { valid: false, code: 'MALFORMED_EVENT', error: `${ev.type} at index ${i} has non-positive addedSeconds` };
+      // Schema V1 requires addedSeconds to be exactly 5 if specified (§3, §16)
+      if (ev.addedSeconds !== undefined && ev.addedSeconds !== 5) {
+        return {
+          valid: false,
+          code: 'MALFORMED_EVENT',
+          error: `${ev.type} at index ${i} must have addedSeconds === 5 (got ${String(ev.addedSeconds)})`,
+        };
       }
     } else if (ev.type === 'RESUME') {
-      if (ev.pauseDurationMs !== undefined && (typeof ev.pauseDurationMs !== 'number' || ev.pauseDurationMs < 0)) {
-        return { valid: false, code: 'MALFORMED_EVENT', error: `RESUME at index ${i} has negative pauseDurationMs` };
+      if (ev.pauseDurationMs !== undefined && (typeof ev.pauseDurationMs !== 'number' || !Number.isFinite(ev.pauseDurationMs) || ev.pauseDurationMs < 0)) {
+        return { valid: false, code: 'MALFORMED_EVENT', error: `RESUME at index ${i} has negative or invalid pauseDurationMs` };
       }
     } else if (ev.type === 'UNDO') {
+      if (ev.restoredMoveIndex !== undefined && (typeof ev.restoredMoveIndex !== 'number' || ev.restoredMoveIndex < 0)) {
+        return { valid: false, code: 'MALFORMED_EVENT', error: `UNDO event at index ${i} has invalid restoredMoveIndex` };
+      }
+      if (ev.restoredScore !== undefined && (typeof ev.restoredScore !== 'number' || ev.restoredScore < 0)) {
+        return { valid: false, code: 'MALFORMED_EVENT', error: `UNDO event at index ${i} has invalid restoredScore` };
+      }
       if (ev.restoredBoard && !isValidBoardArray(ev.restoredBoard)) {
         return { valid: false, code: 'MALFORMED_EVENT', error: `UNDO event at index ${i} has invalid restoredBoard` };
+      }
+    } else if (ev.type === 'RUN_TERMINAL') {
+      if (ev.reason && !['GAME_OVER', 'TIME_EXPIRED', 'RESIGNED'].includes(ev.reason)) {
+        return { valid: false, code: 'MALFORMED_EVENT', error: `RUN_TERMINAL at index ${i} has invalid reason: ${String(ev.reason)}` };
       }
     }
   }
 
-  // 5. Checkpoints Array & Limits
+  // 5. Checkpoints Array & Hex Validation (§11, §15)
   if (!Array.isArray(replay.checkpoints)) {
     return { valid: false, code: 'INVALID_METADATA', error: 'checkpoints field must be an array' };
   }
@@ -289,7 +313,7 @@ export function validateReplayV1(raw: unknown): ReplayValidationResult {
     };
   }
 
-  let lastCheckpointMoveIndex = -1;
+  let lastCheckpointEventIndex = -1;
   for (let j = 0; j < replay.checkpoints.length; j++) {
     const cp = replay.checkpoints[j];
     if (!cp || typeof cp !== 'object') {
@@ -298,14 +322,18 @@ export function validateReplayV1(raw: unknown): ReplayValidationResult {
     if (typeof cp.moveIndex !== 'number' || cp.moveIndex < 0) {
       return { valid: false, code: 'MALFORMED_CHECKPOINT', error: `Checkpoint at index ${j} has invalid moveIndex` };
     }
-    if (cp.moveIndex <= lastCheckpointMoveIndex) {
-      return {
-        valid: false,
-        code: 'MALFORMED_CHECKPOINT',
-        error: `Checkpoint at index ${j} moveIndex (${cp.moveIndex}) is not strictly increasing`,
-      };
+
+    // Checkpoint timeline ordering: eventIndex must be strictly increasing if provided
+    if (cp.eventIndex !== undefined) {
+      if (typeof cp.eventIndex !== 'number' || cp.eventIndex <= lastCheckpointEventIndex) {
+        return {
+          valid: false,
+          code: 'MALFORMED_CHECKPOINT',
+          error: `Checkpoint at index ${j} eventIndex (${cp.eventIndex}) is not strictly increasing`,
+        };
+      }
+      lastCheckpointEventIndex = cp.eventIndex;
     }
-    lastCheckpointMoveIndex = cp.moveIndex;
 
     if (!isValidBoardArray(cp.board)) {
       return { valid: false, code: 'MALFORMED_CHECKPOINT', error: `Checkpoint at index ${j} has invalid board` };
@@ -319,12 +347,18 @@ export function validateReplayV1(raw: unknown): ReplayValidationResult {
     if (cp.competitiveClass !== 'PURE' && cp.competitiveClass !== 'ASSISTED') {
       return { valid: false, code: 'MALFORMED_CHECKPOINT', error: `Checkpoint at index ${j} has invalid competitiveClass` };
     }
-    if (typeof cp.boardHash !== 'string' || cp.boardHash.length !== 64) {
-      return { valid: false, code: 'MALFORMED_CHECKPOINT', error: `Checkpoint at index ${j} has invalid boardHash (expected 64-char hex)` };
+
+    // Strict SHA-256 Hex validation (§15)
+    if (typeof cp.boardHash !== 'string' || !SHA256_HEX_REGEX.test(cp.boardHash)) {
+      return {
+        valid: false,
+        code: 'MALFORMED_CHECKPOINT',
+        error: `Checkpoint at index ${j} has invalid boardHash (must be valid 64-char lowercase/uppercase hex)`,
+      };
     }
   }
 
-  // 6. Final Summary Integrity
+  // 6. Final Summary Integrity & Hex Validation (§15)
   if (!replay.finalSummary || typeof replay.finalSummary !== 'object') {
     return { valid: false, code: 'MALFORMED_FINAL_SUMMARY', error: 'Missing or malformed finalSummary' };
   }
@@ -333,8 +367,12 @@ export function validateReplayV1(raw: unknown): ReplayValidationResult {
   if (!isValidBoardArray(fs.finalBoard)) {
     return { valid: false, code: 'MALFORMED_FINAL_SUMMARY', error: 'finalSummary has invalid finalBoard' };
   }
-  if (typeof fs.finalBoardHash !== 'string' || fs.finalBoardHash.length !== 64) {
-    return { valid: false, code: 'MALFORMED_FINAL_SUMMARY', error: 'finalSummary has invalid finalBoardHash' };
+  if (typeof fs.finalBoardHash !== 'string' || !SHA256_HEX_REGEX.test(fs.finalBoardHash)) {
+    return {
+      valid: false,
+      code: 'MALFORMED_FINAL_SUMMARY',
+      error: 'finalSummary has invalid finalBoardHash (must be valid 64-char hex)',
+    };
   }
   if (typeof fs.score !== 'number' || fs.score < 0) {
     return { valid: false, code: 'MALFORMED_FINAL_SUMMARY', error: 'finalSummary has invalid score' };
@@ -380,7 +418,262 @@ export interface ReplayPlaybackState {
   competitiveClass: 'PURE' | 'ASSISTED';
   undosUsed: number;
   timeBoostsUsed: number;
+  highestTileEver: number; // Monotonic highest tile reached in run (§2, §5)
   isPaused: boolean;
+}
+
+export interface FullUndoSnapshot {
+  board: Uint16Array;
+  score: number;
+  moveIndex: number;
+  status: GameStatus;
+  rngState: number;
+  timer: TimerState;
+  competitiveClass: 'PURE' | 'ASSISTED';
+  highestTileEver: number;
+  timeBoostsUsed: number;
+  undosUsed: number;
+}
+
+export interface ReplayApplyResult {
+  nextState: ReplayPlaybackState;
+  spawnMismatch?: {
+    moveIndex: number;
+    expected: unknown;
+    actual: unknown;
+    message: string;
+  };
+}
+
+/**
+ * Pure canonical playback reducer (§13).
+ * Single authoritative source of truth for all Replay V1 state mutations across
+ * full playback, verification, and interactive stepping.
+ */
+export function applyReplayEventV1(
+  current: ReplayPlaybackState,
+  event: ReplayEventV1,
+  history: FullUndoSnapshot[]
+): ReplayApplyResult {
+  switch (event.type) {
+    case 'RUN_START':
+      return { nextState: current };
+
+    case 'MOVE': {
+      if (!event.direction) return { nextState: current };
+
+      const moveRes = executeMove(current.board, event.direction);
+      if (moveRes.changed) {
+        // 1. Save full pre-move snapshot to history
+        history.push({
+          board: cloneBoard(current.board),
+          score: current.score,
+          moveIndex: current.moveIndex,
+          status: current.status,
+          rngState: current.rngState,
+          timer: { ...current.timer },
+          competitiveClass: current.competitiveClass,
+          highestTileEver: current.highestTileEver,
+          timeBoostsUsed: current.timeBoostsUsed,
+          undosUsed: current.undosUsed,
+        });
+
+        // 2. Apply explicit spawn if recorded
+        if (event.spawn) {
+          if (moveRes.board[event.spawn.index] !== 0) {
+            return {
+              nextState: current,
+              spawnMismatch: {
+                moveIndex: current.moveIndex + 1,
+                expected: `cell ${event.spawn.index} empty`,
+                actual: `cell occupied by ${moveRes.board[event.spawn.index]}`,
+                message: `Desync: explicit spawn into non-empty cell ${event.spawn.index}`,
+              },
+            };
+          }
+          moveRes.board[event.spawn.index] = event.spawn.value;
+        }
+
+        const nextScore = current.score + moveRes.scoreDelta;
+        const nextMoveIndex = current.moveIndex + 1;
+        const currentBoardHighest = getHighestTile(moveRes.board);
+        const nextHighestTileEver = Math.max(current.highestTileEver, currentBoardHighest);
+
+        // 3. Reset adaptive timer to the current stage base duration (§2, §4)
+        const stageBaseMs = getAdaptiveTimerStageBaseMs(nextHighestTileEver);
+        const nextTimer: TimerState = {
+          durationMs: stageBaseMs,
+          timeRemainingMs: stageBaseMs,
+          currentTier: 1,
+          deadlineTimestampMs: event.t + stageBaseMs,
+        };
+
+        const gameOver = isGameOver(moveRes.board);
+
+        return {
+          nextState: {
+            ...current,
+            board: moveRes.board,
+            score: nextScore,
+            bestScore: Math.max(current.bestScore, nextScore),
+            moveIndex: nextMoveIndex,
+            highestTileEver: nextHighestTileEver,
+            timer: nextTimer,
+            status: gameOver ? 'GAME_OVER' : 'ACTIVE',
+          },
+        };
+      } else {
+        // No-op move (§2, §4): board unchanged, moveIndex unchanged, timer NOT reset
+        return { nextState: current };
+      }
+    }
+
+    case 'PAUSE': {
+      return {
+        nextState: {
+          ...current,
+          isPaused: true,
+        },
+      };
+    }
+
+    case 'RESUME': {
+      return {
+        nextState: {
+          ...current,
+          isPaused: false,
+        },
+      };
+    }
+
+    case 'TIME_BOOST': {
+      // Canonical +5s with adaptive cap (§3)
+      const stageBaseMs = getAdaptiveTimerStageBaseMs(current.highestTileEver);
+      const maxCapMs = getAdaptiveTimerMaxCapMs(stageBaseMs);
+      const addedMs = (event.addedSeconds ?? 5) * 1000;
+      const newRemainingMs = Math.min(maxCapMs, current.timer.timeRemainingMs + addedMs);
+
+      return {
+        nextState: {
+          ...current,
+          timeBoostsUsed: current.timeBoostsUsed + 1,
+          competitiveClass: 'ASSISTED',
+          timer: {
+            ...current.timer,
+            timeRemainingMs: newRemainingMs,
+            deadlineTimestampMs: event.t + newRemainingMs,
+          },
+        },
+      };
+    }
+
+    case 'ASSISTED_TRANSITION': {
+      return {
+        nextState: {
+          ...current,
+          competitiveClass: 'ASSISTED',
+        },
+      };
+    }
+
+    case 'RESCUE_TIMEOUT': {
+      // Timeout Rescue (§7): Reactivate timer with +5s, mark ASSISTED
+      const stageBaseMs = getAdaptiveTimerStageBaseMs(current.highestTileEver);
+      const maxCapMs = getAdaptiveTimerMaxCapMs(stageBaseMs);
+      const addedMs = (event.addedSeconds ?? 5) * 1000;
+      const newRemainingMs = Math.min(maxCapMs, addedMs);
+
+      return {
+        nextState: {
+          ...current,
+          timeBoostsUsed: current.timeBoostsUsed + 1,
+          competitiveClass: 'ASSISTED',
+          status: 'ACTIVE',
+          timer: {
+            ...current.timer,
+            timeRemainingMs: newRemainingMs,
+            deadlineTimestampMs: event.t + newRemainingMs,
+          },
+        },
+      };
+    }
+
+    case 'RESCUE_UNDO': {
+      const prior = history.pop();
+      if (prior) {
+        return {
+          nextState: {
+            ...current,
+            board: prior.board,
+            score: prior.score,
+            moveIndex: prior.moveIndex,
+            rngState: prior.rngState,
+            timer: { ...prior.timer },
+            status: 'ACTIVE',
+            highestTileEver: current.highestTileEver, // Monotonic invariant: never decreases!
+            undosUsed: current.undosUsed + 1,
+            competitiveClass: 'ASSISTED',
+          },
+        };
+      }
+      return {
+        nextState: {
+          ...current,
+          undosUsed: current.undosUsed + 1,
+          competitiveClass: 'ASSISTED',
+        },
+      };
+    }
+
+    case 'UNDO': {
+      const prior = history.pop();
+      if (prior) {
+        return {
+          nextState: {
+            ...current,
+            board: prior.board,
+            score: prior.score,
+            moveIndex: prior.moveIndex,
+            rngState: prior.rngState,
+            timer: { ...prior.timer },
+            status: prior.status,
+            highestTileEver: current.highestTileEver, // Monotonic invariant: never decreases!
+            undosUsed: current.undosUsed + 1,
+            competitiveClass:
+              current.competitiveClass === 'ASSISTED' ? 'ASSISTED' : prior.competitiveClass,
+          },
+        };
+      } else if (event.restoredBoard && event.restoredScore !== undefined && event.restoredMoveIndex !== undefined) {
+        return {
+          nextState: {
+            ...current,
+            board: createBoardFrom(event.restoredBoard),
+            score: event.restoredScore,
+            moveIndex: event.restoredMoveIndex,
+            undosUsed: current.undosUsed + 1,
+          },
+        };
+      }
+      return {
+        nextState: {
+          ...current,
+          undosUsed: current.undosUsed + 1,
+        },
+      };
+    }
+
+    case 'RUN_TERMINAL': {
+      if (event.reason === 'TIME_EXPIRED') {
+        return { nextState: { ...current, status: 'TIME_EXPIRED' } };
+      } else if (event.reason === 'GAME_OVER') {
+        return { nextState: { ...current, status: 'GAME_OVER' } };
+      }
+      return { nextState: current };
+    }
+
+    default:
+      return { nextState: current };
+  }
 }
 
 export interface ReplayPlaybackResult {
@@ -397,20 +690,8 @@ export interface ReplayPlaybackResult {
   matchedCheckpointsCount: number;
 }
 
-interface FullUndoSnapshot {
-  board: Uint16Array;
-  score: number;
-  moveIndex: number;
-  status: GameStatus;
-  rngState: number;
-  timer: TimerState;
-  competitiveClass: 'PURE' | 'ASSISTED';
-  highestTile: number;
-}
-
 /**
- * Executes a deterministic playback of a Replay V1 payload, enforcing complete event semantics:
- * Time Boost timer mutation, Assisted transition, Undo full state restoration, and final integrity checks.
+ * Executes a deterministic playback of a Replay V1 payload via the canonical pure reducer.
  */
 export function playReplayV1(
   replay: ReplayV1,
@@ -421,9 +702,17 @@ export function playReplayV1(
     throw new Error(`Cannot play invalid replay: [${validation.code}] ${validation.error}`);
   }
 
-  // Initialize game state with provided initial board & seed
   const { state: initial } = createGame({ seed: replay.seed, currentTimeMs: 0 });
   const board = createBoardFrom(replay.initialBoard);
+  const initialHighest = getHighestTile(board);
+
+  const initialTimerBaseMs = getAdaptiveTimerStageBaseMs(initialHighest);
+  const initialTimer: TimerState = {
+    durationMs: initialTimerBaseMs,
+    timeRemainingMs: initialTimerBaseMs,
+    currentTier: 1,
+    deadlineTimestampMs: replay.startedAt + initialTimerBaseMs,
+  };
 
   let current: ReplayPlaybackState = {
     board,
@@ -432,10 +721,11 @@ export function playReplayV1(
     moveIndex: 0,
     status: 'ACTIVE',
     rngState: initial.rngState,
-    timer: { ...initial.timer },
+    timer: initialTimer,
     competitiveClass: replay.competitiveClassAtStart ?? 'PURE',
     undosUsed: 0,
     timeBoostsUsed: 0,
+    highestTileEver: initialHighest,
     isPaused: false,
   };
 
@@ -445,7 +735,6 @@ export function playReplayV1(
     checkpointsMap.set(cp.moveIndex, cp);
   }
 
-  // Full snapshot history stack for complete Undo reconstruction
   const localHistory: FullUndoSnapshot[] = [];
 
   for (let eventIdx = 0; eventIdx < replay.events.length; eventIdx++) {
@@ -455,219 +744,58 @@ export function playReplayV1(
       break;
     }
 
-    switch (event.type) {
-      case 'RUN_START': {
-        // Run initialized
-        break;
-      }
+    const { nextState, spawnMismatch } = applyReplayEventV1(current, event, localHistory);
+    if (spawnMismatch) {
+      return {
+        success: false,
+        desyncDetected: true,
+        finalState: current,
+        matchedCheckpointsCount,
+        desyncDetails: {
+          type: 'SPAWN_MISMATCH',
+          moveIndex: spawnMismatch.moveIndex,
+          expected: spawnMismatch.expected,
+          actual: spawnMismatch.actual,
+          message: spawnMismatch.message,
+        },
+      };
+    }
 
-      case 'MOVE': {
-        if (!event.direction) break;
+    current = nextState;
 
-        // 1. Capture comprehensive snapshot before valid move
-        const preMoveSnapshot: FullUndoSnapshot = {
-          board: cloneBoard(current.board),
-          score: current.score,
-          moveIndex: current.moveIndex,
-          status: current.status,
-          rngState: current.rngState,
-          timer: { ...current.timer },
-          competitiveClass: current.competitiveClass,
-          highestTile: getHighestTile(current.board),
-        };
+    // Checkpoint validation after valid state-advancing move
+    if (event.type === 'MOVE') {
+      const cp = checkpointsMap.get(current.moveIndex);
+      if (cp) {
+        const currentHighest = getHighestTile(current.board);
+        const currentHash = computeBoardHash(
+          current.board,
+          current.score,
+          current.moveIndex,
+          currentHighest
+        );
 
-        // 2. Execute move shift & merge
-        const moveRes = executeMove(current.board, event.direction);
-
-        if (moveRes.changed) {
-          localHistory.push(preMoveSnapshot);
-
-          // Apply explicit resulting spawn if recorded
-          if (event.spawn) {
-            if (moveRes.board[event.spawn.index] !== 0) {
-              return {
-                success: false,
-                desyncDetected: true,
-                finalState: current,
-                matchedCheckpointsCount,
-                desyncDetails: {
-                  type: 'SPAWN_MISMATCH',
-                  moveIndex: current.moveIndex + 1,
-                  expected: `cell ${event.spawn.index} empty`,
-                  actual: `cell occupied by ${moveRes.board[event.spawn.index]}`,
-                  message: `Desync: explicit spawn into non-empty cell ${event.spawn.index}`,
-                },
-              };
-            }
-            moveRes.board[event.spawn.index] = event.spawn.value;
-          }
-
-          const nextScore = current.score + moveRes.scoreDelta;
-          const nextMoveIndex = current.moveIndex + 1;
-          const gameOver = isGameOver(moveRes.board);
-
-          current = {
-            ...current,
-            board: moveRes.board,
-            score: nextScore,
-            bestScore: Math.max(current.bestScore, nextScore),
-            moveIndex: nextMoveIndex,
-            status: gameOver ? 'GAME_OVER' : 'ACTIVE',
-          };
-
-          // 3. Verify periodic checkpoint if present at this moveIndex
-          const cp = checkpointsMap.get(current.moveIndex);
-          if (cp) {
-            const currentHighest = getHighestTile(current.board);
-            const currentHash = computeBoardHash(
-              current.board,
-              current.score,
-              current.moveIndex,
-              currentHighest
-            );
-
-            if (
-              currentHash !== cp.boardHash ||
-              current.score !== cp.score ||
-              currentHighest !== cp.highestTile ||
-              current.competitiveClass !== cp.competitiveClass
-            ) {
-              return {
-                success: false,
-                desyncDetected: true,
-                finalState: current,
-                matchedCheckpointsCount,
-                desyncDetails: {
-                  type: 'CHECKPOINT_MISMATCH',
-                  moveIndex: current.moveIndex,
-                  expected: { hash: cp.boardHash, score: cp.score, compClass: cp.competitiveClass },
-                  actual: { hash: currentHash, score: current.score, compClass: current.competitiveClass },
-                  message: `Desync at move ${current.moveIndex}: checkpoint mismatch`,
-                },
-              };
-            }
-            matchedCheckpointsCount++;
-          }
-        } else {
-          // No-op move: board unchanged, snapshot discarded
-        }
-        break;
-      }
-
-      case 'PAUSE': {
-        current = {
-          ...current,
-          isPaused: true,
-        };
-        break;
-      }
-
-      case 'RESUME': {
-        current = {
-          ...current,
-          isPaused: false,
-        };
-        break;
-      }
-
-      case 'TIME_BOOST': {
-        const addedSec = event.addedSeconds ?? 5;
-        const addedMs = addedSec * 1000;
-        current = {
-          ...current,
-          timeBoostsUsed: current.timeBoostsUsed + 1,
-          competitiveClass: 'ASSISTED',
-          timer: {
-            ...current.timer,
-            deadlineTimestampMs: current.timer.deadlineTimestampMs + addedMs,
-            timeRemainingMs: current.timer.timeRemainingMs + addedMs,
-          },
-        };
-        break;
-      }
-
-      case 'ASSISTED_TRANSITION': {
-        current = {
-          ...current,
-          competitiveClass: 'ASSISTED',
-        };
-        break;
-      }
-
-      case 'RESCUE_TIMEOUT': {
-        const addedSec = event.addedSeconds ?? 5;
-        const addedMs = addedSec * 1000;
-        current = {
-          ...current,
-          timeBoostsUsed: current.timeBoostsUsed + 1,
-          competitiveClass: 'ASSISTED',
-          status: 'ACTIVE',
-          timer: {
-            ...current.timer,
-            deadlineTimestampMs: current.timer.deadlineTimestampMs + addedMs,
-            timeRemainingMs: addedMs,
-          },
-        };
-        break;
-      }
-
-      case 'RESCUE_UNDO': {
-        current = {
-          ...current,
-          undosUsed: current.undosUsed + 1,
-          competitiveClass: 'ASSISTED',
-        };
-        const prior = localHistory.pop();
-        if (prior) {
-          current = {
-            ...current,
-            board: prior.board,
-            score: prior.score,
-            moveIndex: prior.moveIndex,
-            rngState: prior.rngState,
-            timer: { ...prior.timer },
-            status: 'ACTIVE',
+        if (
+          currentHash !== cp.boardHash ||
+          current.score !== cp.score ||
+          currentHighest !== cp.highestTile ||
+          current.competitiveClass !== cp.competitiveClass
+        ) {
+          return {
+            success: false,
+            desyncDetected: true,
+            finalState: current,
+            matchedCheckpointsCount,
+            desyncDetails: {
+              type: 'CHECKPOINT_MISMATCH',
+              moveIndex: current.moveIndex,
+              expected: { hash: cp.boardHash, score: cp.score, compClass: cp.competitiveClass },
+              actual: { hash: currentHash, score: current.score, compClass: current.competitiveClass },
+              message: `Desync at move ${current.moveIndex}: checkpoint mismatch`,
+            },
           };
         }
-        break;
-      }
-
-      case 'UNDO': {
-        current = {
-          ...current,
-          undosUsed: current.undosUsed + 1,
-        };
-        const prior = localHistory.pop();
-        if (prior) {
-          current = {
-            ...current,
-            board: prior.board,
-            score: prior.score,
-            moveIndex: prior.moveIndex,
-            rngState: prior.rngState,
-            timer: { ...prior.timer },
-            // Keep current competitiveClass if it has been marked ASSISTED
-            competitiveClass:
-              current.competitiveClass === 'ASSISTED' ? 'ASSISTED' : prior.competitiveClass,
-          };
-        } else if (event.restoredBoard && event.restoredScore !== undefined && event.restoredMoveIndex !== undefined) {
-          current = {
-            ...current,
-            board: createBoardFrom(event.restoredBoard),
-            score: event.restoredScore,
-            moveIndex: event.restoredMoveIndex,
-          };
-        }
-        break;
-      }
-
-      case 'RUN_TERMINAL': {
-        if (event.reason === 'TIME_EXPIRED') {
-          current = { ...current, status: 'TIME_EXPIRED' };
-        } else if (event.reason === 'GAME_OVER') {
-          current = { ...current, status: 'GAME_OVER' };
-        }
-        break;
+        matchedCheckpointsCount++;
       }
     }
   }
@@ -745,7 +873,7 @@ export function playReplayV1(
       };
     }
 
-    // 5. Final Board Array Verification
+    // 5. Final Board Array
     const currentBoardArr = Array.from(current.board);
     const boardsMatch = fs.finalBoard.every((val, idx) => val === currentBoardArr[idx]);
     if (!boardsMatch) {
@@ -764,7 +892,7 @@ export function playReplayV1(
       };
     }
 
-    // 6. Final Board Hash Verification
+    // 6. Final Board Hash
     const computedFinalHash = computeBoardHash(
       current.board,
       current.score,
@@ -787,7 +915,7 @@ export function playReplayV1(
       };
     }
 
-    // 7. Terminal Reason Verification (if deterministically checkable)
+    // 7. Terminal Reason
     if (fs.terminalReason === 'GAME_OVER' && !isGameOver(current.board)) {
       return {
         success: false,
@@ -824,9 +952,9 @@ export interface ReplayPlayerInstance {
 }
 
 /**
- * Creates an interactive stepping/seeking pure replay player instance with explicit canonical timeline indexing.
- * Resolves Option B: builds canonical playback index from actual applied state transitions,
- * ensuring seeking through no-ops, Undos, and branched paths lands on the authentic final state.
+ * Creates an interactive stepping/seeking pure replay player instance.
+ * Replays from start using the canonical reducer (Option 1: SEEK_STRATEGY = 'REPLAY_FROM_START'),
+ * guaranteeing full semantic state preservation across all Undos, Time Boosts, and branches (§12, §13).
  */
 export function createReplayPlayerV1(replay: ReplayV1): ReplayPlayerInstance {
   const validation = validateReplayV1(replay);
@@ -835,216 +963,73 @@ export function createReplayPlayerV1(replay: ReplayV1): ReplayPlayerInstance {
   }
 
   const { state: initial } = createGame({ seed: replay.seed, currentTimeMs: 0 });
-  const initialState: ReplayPlaybackState = {
+  const initialBoard = createBoardFrom(replay.initialBoard);
+  const initialHighest = getHighestTile(initialBoard);
+  const initialTimerBaseMs = getAdaptiveTimerStageBaseMs(initialHighest);
+
+  const getInitialState = (): ReplayPlaybackState => ({
     board: createBoardFrom(replay.initialBoard),
     score: 0,
     bestScore: 0,
     moveIndex: 0,
     status: 'ACTIVE',
     rngState: initial.rngState,
-    timer: { ...initial.timer },
+    timer: {
+      durationMs: initialTimerBaseMs,
+      timeRemainingMs: initialTimerBaseMs,
+      currentTier: 1,
+      deadlineTimestampMs: replay.startedAt + initialTimerBaseMs,
+    },
     competitiveClass: replay.competitiveClassAtStart ?? 'PURE',
     undosUsed: 0,
     timeBoostsUsed: 0,
+    highestTileEver: initialHighest,
     isPaused: false,
-  };
+  });
 
-  // Build canonical playback timeline
-  // timeline[0] corresponds to state before any event (at eventIndex 0)
-  // timeline[i] corresponds to state after applying replay.events[i - 1]
-  const timeline: ReplayPlaybackState[] = [initialState];
+  let currentState: ReplayPlaybackState = getInitialState();
+  let currentEventIndex = 0;
   const history: FullUndoSnapshot[] = [];
-  let runner = { ...initialState };
-
-  for (let i = 0; i < replay.events.length; i++) {
-    const event = replay.events[i];
-    switch (event.type) {
-      case 'MOVE': {
-        if (event.direction) {
-          const preSnapshot: FullUndoSnapshot = {
-            board: cloneBoard(runner.board),
-            score: runner.score,
-            moveIndex: runner.moveIndex,
-            status: runner.status,
-            rngState: runner.rngState,
-            timer: { ...runner.timer },
-            competitiveClass: runner.competitiveClass,
-            highestTile: getHighestTile(runner.board),
-          };
-
-          const moveRes = executeMove(runner.board, event.direction);
-          if (moveRes.changed) {
-            history.push(preSnapshot);
-            if (event.spawn && moveRes.board[event.spawn.index] === 0) {
-              moveRes.board[event.spawn.index] = event.spawn.value;
-            }
-            const nextScore = runner.score + moveRes.scoreDelta;
-            runner = {
-              ...runner,
-              board: moveRes.board,
-              score: nextScore,
-              bestScore: Math.max(runner.bestScore, nextScore),
-              moveIndex: runner.moveIndex + 1,
-              status: isGameOver(moveRes.board) ? 'GAME_OVER' : 'ACTIVE',
-            };
-          }
-        }
-        break;
-      }
-
-      case 'PAUSE': {
-        runner = { ...runner, isPaused: true };
-        break;
-      }
-
-      case 'RESUME': {
-        runner = { ...runner, isPaused: false };
-        break;
-      }
-
-      case 'TIME_BOOST': {
-        const addedMs = (event.addedSeconds ?? 5) * 1000;
-        runner = {
-          ...runner,
-          timeBoostsUsed: runner.timeBoostsUsed + 1,
-          competitiveClass: 'ASSISTED',
-          timer: {
-            ...runner.timer,
-            deadlineTimestampMs: runner.timer.deadlineTimestampMs + addedMs,
-            timeRemainingMs: runner.timer.timeRemainingMs + addedMs,
-          },
-        };
-        break;
-      }
-
-      case 'ASSISTED_TRANSITION': {
-        runner = { ...runner, competitiveClass: 'ASSISTED' };
-        break;
-      }
-
-      case 'RESCUE_TIMEOUT': {
-        const addedMs = (event.addedSeconds ?? 5) * 1000;
-        runner = {
-          ...runner,
-          timeBoostsUsed: runner.timeBoostsUsed + 1,
-          competitiveClass: 'ASSISTED',
-          status: 'ACTIVE',
-          timer: {
-            ...runner.timer,
-            deadlineTimestampMs: runner.timer.deadlineTimestampMs + addedMs,
-            timeRemainingMs: addedMs,
-          },
-        };
-        break;
-      }
-
-      case 'RESCUE_UNDO': {
-        runner = {
-          ...runner,
-          undosUsed: runner.undosUsed + 1,
-          competitiveClass: 'ASSISTED',
-        };
-        const prior = history.pop();
-        if (prior) {
-          runner = {
-            ...runner,
-            board: prior.board,
-            score: prior.score,
-            moveIndex: prior.moveIndex,
-            rngState: prior.rngState,
-            timer: { ...prior.timer },
-            status: 'ACTIVE',
-          };
-        }
-        break;
-      }
-
-      case 'UNDO': {
-        runner = {
-          ...runner,
-          undosUsed: runner.undosUsed + 1,
-        };
-        const prior = history.pop();
-        if (prior) {
-          runner = {
-            ...runner,
-            board: prior.board,
-            score: prior.score,
-            moveIndex: prior.moveIndex,
-            rngState: prior.rngState,
-            timer: { ...prior.timer },
-            competitiveClass:
-              runner.competitiveClass === 'ASSISTED' ? 'ASSISTED' : prior.competitiveClass,
-          };
-        } else if (event.restoredBoard && event.restoredScore !== undefined && event.restoredMoveIndex !== undefined) {
-          runner = {
-            ...runner,
-            board: createBoardFrom(event.restoredBoard),
-            score: event.restoredScore,
-            moveIndex: event.restoredMoveIndex,
-          };
-        }
-        break;
-      }
-
-      case 'RUN_TERMINAL': {
-        if (event.reason === 'TIME_EXPIRED') {
-          runner = { ...runner, status: 'TIME_EXPIRED' };
-        } else if (event.reason === 'GAME_OVER') {
-          runner = { ...runner, status: 'GAME_OVER' };
-        }
-        break;
-      }
-    }
-
-    timeline.push({ ...runner });
-  }
-
-  // Canonical moveIndex to timelineIndex mapping:
-  // Tracks the authentic final event index for each moveIndex along the non-reverted trajectory
-  const moveIndexToTimelineIndex = new Map<number, number>();
-  for (let idx = 0; idx < timeline.length; idx++) {
-    const st = timeline[idx];
-    moveIndexToTimelineIndex.set(st.moveIndex, idx);
-  }
-
-  let currentTimelineIndex = 0;
 
   function stepForward(): boolean {
-    if (currentTimelineIndex >= replay.events.length) {
+    if (currentEventIndex >= replay.events.length) {
       return false;
     }
-    currentTimelineIndex++;
+
+    const event = replay.events[currentEventIndex];
+    currentEventIndex++;
+
+    const { nextState } = applyReplayEventV1(currentState, event, history);
+    currentState = nextState;
     return true;
   }
 
   function seekToMoveIndex(targetMoveIndex: number): boolean {
     if (targetMoveIndex < 0) return false;
 
-    const targetTimelineIdx = moveIndexToTimelineIndex.get(targetMoveIndex);
-    if (targetTimelineIdx !== undefined) {
-      currentTimelineIndex = targetTimelineIdx;
-      return true;
+    // Reset to start (SEEK_STRATEGY = 'REPLAY_FROM_START', §12)
+    currentState = getInitialState();
+    currentEventIndex = 0;
+    history.length = 0;
+
+    // Advance event by event until targetMoveIndex reached or end of events
+    while (currentEventIndex < replay.events.length) {
+      if (currentState.moveIndex >= targetMoveIndex && replay.events[currentEventIndex].type === 'MOVE') {
+        break;
+      }
+      stepForward();
     }
 
-    // If exact targetMoveIndex not found in canonical map, find closest prior
-    let closestIdx = 0;
-    for (const [mIdx, tIdx] of moveIndexToTimelineIndex.entries()) {
-      if (mIdx <= targetMoveIndex && tIdx > closestIdx) {
-        closestIdx = tIdx;
-      }
-    }
-    currentTimelineIndex = closestIdx;
     return true;
   }
 
   return {
-    getCurrentState: () => ({ ...timeline[currentTimelineIndex] }),
-    getCurrentMoveIndex: () => timeline[currentTimelineIndex].moveIndex,
-    getCurrentEventIndex: () => currentTimelineIndex,
+    getCurrentState: () => ({ ...currentState }),
+    getCurrentMoveIndex: () => currentState.moveIndex,
+    getCurrentEventIndex: () => currentEventIndex,
     stepForward,
     seekToMoveIndex,
-    isAtEnd: () => currentTimelineIndex >= replay.events.length,
+    isAtEnd: () => currentEventIndex >= replay.events.length,
     getReplay: () => replay,
   };
 }
