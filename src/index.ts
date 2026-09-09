@@ -33,6 +33,8 @@ export {
   RULESET_VERSION,
   DEFAULT_CHECKPOINT_CADENCE,
   MAX_REPLAY_EVENTS_LIMIT,
+  MAX_REPLAY_CHECKPOINTS_LIMIT,
+  MAX_REPLAY_SERIALIZED_BYTES_LIMIT,
   computeBoardHash,
   validateReplayV1,
   playReplayV1,
@@ -67,8 +69,10 @@ export type {
   ReplayFinalSummaryV1,
   ReplayV1,
   ReplayValidationResult,
+  ReplayValidationErrorCode,
+  ReplayDesyncType,
+  ReplayPlaybackState,
   ReplayPlaybackResult,
   ReplayPlayerInstance,
 } from './replay.js';
 export type { PRNGResult } from './prng.js';
-
