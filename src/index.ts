@@ -28,6 +28,16 @@ export {
 } from './timer.js';
 export { createUndoSnapshot, pushHistory, popHistory } from './undo.js';
 export { serializeGameState, deserializeGameState, CURRENT_SERIALIZATION_VERSION } from './serialization.js';
+export {
+  REPLAY_SCHEMA_VERSION,
+  RULESET_VERSION,
+  DEFAULT_CHECKPOINT_CADENCE,
+  MAX_REPLAY_EVENTS_LIMIT,
+  computeBoardHash,
+  validateReplayV1,
+  playReplayV1,
+  createReplayPlayerV1,
+} from './replay.js';
 
 // Types
 export type {
@@ -49,4 +59,16 @@ export type {
   SerializedGameState,
   ReplayAction,
 } from './types.js';
+export type {
+  ReplayEventType,
+  ReplayExplicitSpawn,
+  ReplayEventV1,
+  ReplayCheckpointV1,
+  ReplayFinalSummaryV1,
+  ReplayV1,
+  ReplayValidationResult,
+  ReplayPlaybackResult,
+  ReplayPlayerInstance,
+} from './replay.js';
 export type { PRNGResult } from './prng.js';
+
